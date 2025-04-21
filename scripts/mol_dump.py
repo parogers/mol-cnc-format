@@ -6,6 +6,7 @@ import io
 
 
 commands = []
+unknown_commands = set()
 
 def read_command(file):
     cmd = read_uword(file)
@@ -54,11 +55,18 @@ def read_uword(file):
 
 def read_word(file):
     v = read_uword(file)
+    if v is None:
+        return None
     if v>=0x80000000:
         v = v - 0x80000000
         v = -0x80000000 + v
     return v
 
+
+def read_num_words(file):
+    value = read_uword(file)
+    # What do the upper two bytes represent? (they're usually zero)
+    return value & 0xFFFF
 
 
 def read_unknown_command(file, cmd):
@@ -66,37 +74,48 @@ def read_unknown_command(file, cmd):
         print('skipping no-op')
         print()
         return
+    unknown_commands.add(cmd)
     cmd_pos = file.tell() - 4
     print('unknown command', hex(cmd), 'at', hex(cmd_pos))
     num_words = cmd >> 24
     if num_words == 0x80:
-        num_words = read_uword(file)
+        num_words = read_num_words(file)
+        print('variable length words:', num_words, hex(num_words))
     for n in range(num_words):
         data = file.read(4)
+        if not data:
+            raise Exception('unexpected end of file')
         value_word = read_word(io.BytesIO(data))
+        value_uword = read_uword(io.BytesIO(data))
         value_float = read_float(io.BytesIO(data))
-        print('->', value_word, value_float)
+        print('->', hex(value_uword), value_uword, value_word, value_float)
     print()
 
 
 def read_motion_block(file):
+    moves = 0
     num_words = read_uword(file)
     end_pos = file.tell() + 4*num_words
-
     print()
     print('motion block length:', num_words)
     print()
     while file.tell() < end_pos:
         cmd = read_command(file)
         if cmd == 0x03026000: # move relative
-            axis = read_uword(file) # lower two nibbles (values 3, 4)
+            # X axis is 4
+            # Y axis is 3
+            axis = read_uword(file) # lower two bytes (values 3, 4)
             dx = read_word(file)
             dy = read_word(file)
             # px = px + dx
             # py = py + dy
             print('move by', dx, dy, hex(axis))
+            moves += 1
         elif cmd == 0x1000b06:
-            read_unknown_command(file, cmd)
+            # Blower control (lowest byte is on/off, second lowest is register/port/IO address?)
+            value = read_uword(file)
+            print('blower control:', hex(value))
+            print()
         elif cmd == 0x1000806:
             read_unknown_command(file, cmd)
         elif cmd == 0x01000606: # switch laser
@@ -112,10 +131,12 @@ def read_motion_block(file):
             print('set speeds', speed_min, speed_max, accel)
         else:
             raise Exception(f'unknown command: {hex(cmd)}')
+    return moves
 
 
 def read_subroutine(file):
     laser_on = 0
+    moves = 0
     while True:
         cmd_pos = file.tell()
         cmd = read_command(file)
@@ -125,36 +146,122 @@ def read_subroutine(file):
             print('subroutine', section)
             print()
         elif cmd == 0x80000946:
-            read_motion_block(file)
+            moves += read_motion_block(file)
         elif cmd == 0x01400048: # end of subroutine
             section = read_word(file) # subroutine number
             print('done subroutine', section)
+            print('move commands:', moves)
             break
         elif cmd == 0x80600148:
             print('motion settings', hex(cmd), 'at', hex(cmd_pos))
             read_motion_settings_command(file, cmd)
+        elif cmd == 0x5000e46:
+            # Laser power and speed settings
+            corner_power = read_word(file)
+            max_power = read_word(file)
+            cutting_start_speed = read_float(file)
+            cutting_max_speed = read_float(file)
+            unknown = read_uword(file)
+            # assert unknown == 0, unknown # unknown
+            print(
+                'laser power',
+                corner_power,
+                max_power,
+                cutting_start_speed,
+                cutting_max_speed,
+                unknown,
+            )
+            print()
+        elif cmd == 0x7000e46:
+            # Extended laser power and speed settings
+            corner_power = read_word(file)
+            max_power = read_word(file)
+            corner_power2 = read_word(file) # (second head?)
+            max_power2 = read_word(file) # (second head?)
+            cutting_start_speed = read_float(file)
+            cutting_max_speed = read_float(file)
+            unknown = read_uword(file)
+            # assert unknown == 0 # unknown
+            print(
+                'laser power (extended)',
+                corner_power,
+                max_power,
+                corner_power2,
+                max_power2,
+                cutting_start_speed,
+                cutting_max_speed,
+                unknown,
+            )
+            print()
+        elif cmd == 0x2004a41:
+            axis = read_uword(file)
+            value = read_uword(file)
+            print('something about axis', axis, value)
+            print()
+        elif cmd == 0x1004b41:
+            value = read_uword(file)
+            print('something about axis', hex(value))
+            print()
+
+        elif cmd == 0x80000146:
+            # TODO - are engrave related commands part of their own block? (ie
+            # grouped together with another command like motion blocks)
+            print('engrave line')
+            num_words = read_num_words(file)
+            for n in range(num_words):
+                value = read_uword(file)
+                print('-> ', hex(value), value)
+            print()
+
+        elif cmd == 0x2010040:
+            # Related to engraving
+            axis = read_uword(file)
+            amount = read_word(file)
+            print('step axis')
+            print('-> axis', axis, 'by', amount)
+            print()
+
+        elif cmd == 0x2014040:
+            # Related to engraving
+            axis = read_uword(file)
+            amount = read_word(file)
+            print('sweep axis')
+            print('-> axis', axis, 'by', amount)
+            print()
+
         else:
             read_unknown_command(file, cmd)
     print()
 
 
 def read_motion_settings_command(file, cmd):
-    # 6-param version according to london hackerspace
-    # arg1 is unknown, but repeats in 'unknown 11'
-    # arg2 is the start speed for all head movements as described in the settings
-    # arg3 is the maximum speed for moving around "quickly"
-    # arg4 is the acceleration value to get to the above speed (space acc)
-    # arg5 is the value for acceleration from the settings
-    # arg6 is the acceleration when going from vector to vector
-    num_words = read_word(file)
-    assert num_words in (2, 6)
-    for n in range(num_words):
-        if n == 0:
-            value = read_word(file)
-        else:
-            value = read_float(file)
-        print('->', value)
-    print()
+    num_words = read_uword(file)
+    if num_words == 2:
+        value1 = read_word(file)
+        value2 = read_float(file)
+        assert value1 == int(value2)
+        print('short settings', value1, value2)
+        print()
+
+    elif num_words == 6:
+        # 6-param version according to london hackerspace
+        # arg1 is unknown, but repeats in 'unknown 11'
+        # arg2 is the start speed for all head movements as described in the settings
+        # arg3 is the maximum speed for moving around "quickly"
+        # arg4 is the acceleration value to get to the above speed (space acc)
+        # arg5 is the value for acceleration from the settings
+        # arg6 is the acceleration when going from vector to vector
+        value = read_word(file) # subroutine number 603? (Matthias indicated so)
+        start_speed = read_float(file)
+        max_speed = read_float(file)
+        accel = read_float(file)
+        accel2 = read_float(file)
+        accel3 = read_float(file)
+        print('long settings', value, start_speed, max_speed, accel, accel2, accel3)
+        print()
+
+    else:
+        raise Exception(f'unknown motion settings block ({num_words} words)')
 
 
 def dump_file(file):
@@ -173,10 +280,14 @@ def dump_file(file):
     y_max = read_word(file)	# 0x1c
     x_min = read_word(file)	# 0x20
     y_min = read_word(file)	# 0x24
-    unknown3 = read_word(file) # 0x28
-    unknown4 = read_word(file) # 0x2c
+    # unknown3 = read_word(file) # 0x28
+    # unknown4 = read_word(file) # 0x2c
+    unknown_data3 = file.read(4)
+    unknown_data4 = file.read(4)
+
     while file.tell() < 0x00000070:
         assert read_word(file) == 0
+
     config_start = read_word(file) * 512	# 0x70
     test_start = read_word(file) * 512	# 0x74
     cutbox_start = read_word(file) * 512	# 0x78
@@ -185,17 +296,30 @@ def dump_file(file):
     while file.tell() < config_start:
         assert read_uword(file) == 0
 
-    print('unknowns:', unknown1, unknown2, unknown3, unknown4)
+    print('unknowns:', unknown1, unknown2)
+    print(
+        'unknown3:',
+        hex(read_word(io.BytesIO(unknown_data3))),
+        read_word(io.BytesIO(unknown_data3)),
+        read_uword(io.BytesIO(unknown_data3)),
+        read_float(io.BytesIO(unknown_data3)),
+    )
+    print(
+        'unknown4:',
+        hex(read_word(io.BytesIO(unknown_data4))),
+        read_word(io.BytesIO(unknown_data4)),
+        read_uword(io.BytesIO(unknown_data4)),
+        read_float(io.BytesIO(unknown_data4)),
+    )
     print()
-
-    px = 0
-    py = 0
 
     print('##################')
     print('# Config section #')
     print('##################')
     print()
 
+    px = 0
+    py = 0
     file.seek(config_start)
     while True:
         cmd_pos = file.tell()
@@ -203,23 +327,55 @@ def dump_file(file):
         if cmd == 0x200548:
             # Probably start of config section (appears at 0x200)
             pass
-        elif cmd in (0x03026000, 0x03026040): # move to first cut
-            value = read_uword(file)
+        elif cmd in (0x03026000, 0x03026040):
+            # Move to first cut (does this take laser "origin" settings into account?)
+            axes = read_uword(file) # lower 2 bytes
             px = read_word(file)
             py = read_word(file)
-            print('first cut', value, px, py)
+            print('first cut', px, py, hex(axes))
+            print()
         elif cmd == 0x03000e46:
             # Set stepper scale (steps/mm)
             x_scale = read_float(file)
             y_scale = read_float(file)
             z_scale = read_float(file)
             print('scale', hex(cmd), x_scale, y_scale, z_scale)
+            print()
         elif cmd == 0x00200648:
             print('DONE')
+            print()
             break
         elif cmd == 0x80600148:
             print('motion settings', hex(cmd), 'at', hex(cmd_pos))
             read_motion_settings_command(file, cmd)
+        elif cmd == 0x3000341:
+            start_speed = read_float(file)
+            max_speed = read_float(file)
+            accel = read_float(file)
+            print('speed settings', start_speed, max_speed, accel)
+            print()
+        elif cmd == 0x3046040:
+            motion_axis = read_word(file) # lower two bytes
+            value1 = read_uword(file) # (table width + art width)/2
+            value2 = read_uword(file) # (table height + art height)/2
+            print('artwork origin', hex(motion_axis), value1, value2)
+            print()
+        elif cmd == 0x80500048:
+            num_words = read_uword(file)
+            if num_words == 1:
+                value = read_uword(file)
+                assert value == 603
+                print('end subroutine(?)', value)
+                print()
+            elif num_words == 3:
+                value1 = read_uword(file)
+                value2 = read_uword(file)
+                value3 = read_uword(file)
+                assert value1 == 3
+                print('related to subroutine(?)', value1, hex(value2), hex(value3))
+                print()
+            else:
+                raise Exception('unknown arguments to 0x80500048')
         else:
             read_unknown_command(file, cmd)
 
@@ -279,6 +435,16 @@ def main():
 
     for cmd, count in Counter(commands).most_common():
         print(f'{hex(cmd):15s} {count}')
+    print()
+
+    print('####################')
+    print('# Unknown comments #')
+    print('####################')
+    print()
+
+    for cmd in sorted(unknown_commands):
+        print(hex(cmd))
+    print()
 
 
 if __name__ == '__main__':
