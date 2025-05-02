@@ -76,11 +76,11 @@ def read_unknown_command(file, cmd):
         return
     unknown_commands.add(cmd)
     cmd_pos = file.tell() - 4
-    print('unknown command', hex(cmd), 'at', hex(cmd_pos))
+    print(f'unknown command {hex(cmd)} (at {hex(cmd_pos)})')
     num_words = cmd >> 24
     if num_words == 0x80:
         num_words = read_num_words(file)
-        print('variable length words:', num_words, hex(num_words))
+        print('variable length words:', num_words)
     for n in range(num_words):
         data = file.read(4)
         if not data:
@@ -134,13 +134,14 @@ def read_motion_block(file):
     return moves
 
 
-def read_subroutine(file):
+def read_subroutine(file, scale=None, origin_x=0, origin_y=0):
     laser_on = 0
     moves = 0
+    x_pos = origin_x
+    y_pos = origin_y
     while True:
         cmd_pos = file.tell()
         cmd = read_command(file)
-
         if cmd == 0x1300048:
             section = read_uword(file)
             print('subroutine', section)
@@ -206,11 +207,15 @@ def read_subroutine(file):
         elif cmd == 0x80000146:
             # TODO - are engrave related commands part of their own block? (ie
             # grouped together with another command like motion blocks)
-            print('engrave line')
             num_words = read_num_words(file)
+            print(f'engrave line ({hex(cmd)}, num={num_words}, x={round(x_pos/scale, 2)}, y={round(y_pos/scale, 2)})')
             for n in range(num_words):
-                value = read_uword(file)
-                print('-> ', hex(value), value)
+                amount_data = file.read(4)
+                amount_word = read_uword(io.BytesIO(amount_data))
+                amount_short1 = amount_word >> 16
+                amount_short2 = amount_word & 0xFFFF
+                # amount_float = read_float(io.BytesIO(amount_data))
+                print(f'-> {amount_word:08x}', round(amount_short1/scale, 2), round(amount_short2/scale, 2))
             print()
 
         elif cmd == 0x2010040:
@@ -218,16 +223,23 @@ def read_subroutine(file):
             axis = read_uword(file)
             amount = read_word(file)
             print('step axis')
-            print('-> axis', axis, 'by', amount)
+            if axis == 3:
+                y_pos += amount
+                print('-> y-axis by', amount, 'to', round(y_pos/scale, 2))
+            else:
+                x_pos += amount
+                print('-> axis', axis, 'by', amount)
             print()
 
         elif cmd == 0x2014040:
             # Related to engraving
             axis = read_uword(file)
             amount = read_word(file)
+            assert axis == 4
             print('sweep axis')
-            print('-> axis', axis, 'by', amount)
+            print('-> axis', axis, 'from', round(x_pos/scale, 2), 'by', round(amount/scale, 2))
             print()
+            x_pos += amount
 
         else:
             read_unknown_command(file, cmd)
@@ -318,8 +330,12 @@ def dump_file(file):
     print('##################')
     print()
 
+    origin_x = 0
+    origin_y = 0
     px = 0
     py = 0
+    x_scale = 1
+    y_scale = 1
     file.seek(config_start)
     while True:
         cmd_pos = file.tell()
@@ -332,9 +348,11 @@ def dump_file(file):
             axes = read_uword(file) # lower 2 bytes
             px = read_word(file)
             py = read_word(file)
+            origin_x = px
+            origin_y = py
             print('first cut', px, py, hex(axes))
             print()
-        elif cmd == 0x03000e46:
+        elif cmd in (0x03000e46, 0x3000e06):
             # Set stepper scale (steps/mm)
             x_scale = read_float(file)
             y_scale = read_float(file)
@@ -344,6 +362,9 @@ def dump_file(file):
         elif cmd == 0x00200648:
             print('DONE')
             print()
+            break
+        elif cmd == 0x200608:
+            print('DONE???')
             break
         elif cmd == 0x80600148:
             print('motion settings', hex(cmd), 'at', hex(cmd_pos))
@@ -414,7 +435,7 @@ def dump_file(file):
     print('###################')
     print()
     file.seek(cut_start)
-    read_subroutine(file)
+    read_subroutine(file, scale=x_scale, origin_x=origin_x, origin_y=origin_y)
 
     while True:
         cmd = read_command(file)
